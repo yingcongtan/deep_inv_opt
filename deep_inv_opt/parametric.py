@@ -69,7 +69,7 @@ class ParametricLP:
 
       
 def inverse_parametric_linprog(u, x, f,
-                               lr=1.0,
+                               lr=10.0,
                                loss=squared_error,
                                eps=1e-5,
                                eps_decay=False,
@@ -108,6 +108,8 @@ def inverse_parametric_linprog(u, x, f,
     """
 
     assert len(u) == len(x)
+    if not isinstance(lr, (list, tuple)):
+        lr = [lr]   # Broadcast same learning rate to all weights by default
     lr = as_tensor(lr)
     u = u.detach()  # Detach u and x just in case they accidentally requires_grad
     x = x.detach()
@@ -150,6 +152,11 @@ def inverse_parametric_linprog(u, x, f,
         
         # Detach the parameters once gradient for this iteration is computed
         with torch.no_grad():
+
+            # Report current state
+            if callback:
+                callback(step, u, x, f, x_predicts, curr_loss.item())
+
             # Compute direction of descent
             w0 = f.weights.data.clone()
             dw = f.weights.grad.mul(-lr)
@@ -183,9 +190,6 @@ def inverse_parametric_linprog(u, x, f,
                 print("Stopping early due to step_size < 1e-16.")
                 break
 
-            # Report current state
-            if callback:
-                callback(step, u, x, f, x_predicts, curr_loss.item())
 
     # Report final state
     if callback:

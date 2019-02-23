@@ -2,9 +2,11 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
 from .util import as_numpy
 from .util import enumerate_polytope_vertices
 from .linprog import _collect_linprog_central_path
+from .linprog import linprog
 
 
 def _plot_line2d(ax, a, b, c, *args, **kwargs):
@@ -176,13 +178,13 @@ def inverse_linprog_plotter(xylim=None, title=None):
     return inverse_linprog_step_plotter(xylim=xylim, title=title, frequency=100000000)
 
 
-def plot_linear_program(c, A_ub, b_ub, A_eq=None, b_eq=None, color='k', alpha=1.0, linestyle='-', vertex_color=None, cxy=None, ax=None):
+def plot_linprog_hull(c, A_ub, b_ub, A_eq=None, b_eq=None, color='k', alpha=1.0, linestyle='-', vertex_color=None, cxy=None, ax=None):
     """Plots a linear program cost vector c, the convex polytope represented
     by A_ub and b_ub, and optionally equality constraints represented by A_eq and b_eq.
     If vertex_style is given, also plots the vertices where inequality constraints meet.
     
-    The main different from linprog_step_plotter is that the inequality constraints are not
-    plotted as separate lines, but rather processed into a closed polygon.
+    The main different from plot_linprog is that the inequality constraints are not
+    plotted as infinite lines, but rather as a closed polygon.
 
     If no axis `ax` is specified, the current axis is used
     """
@@ -194,7 +196,7 @@ def plot_linear_program(c, A_ub, b_ub, A_eq=None, b_eq=None, color='k', alpha=1.
     if c is not None:
         assert len(c) == 2, "Only 2D supported"
         cx, cy = cxy if cxy is not None else (3, 3)
-        c0, c1 = c.ravel() / np.sum(c**2)**0.5  
+        c0, c1 = c.ravel() #/ np.sum(c**2)**0.5  
         ax.arrow(cx, cy, c0, c1, color=color, alpha=alpha, head_width=0.05, length_includes_head=True)  
 
     if A_ub is not None:
@@ -223,6 +225,14 @@ def plot_targets(x_targets, *args, **kwargs):
     ax = kwargs.get('ax', None)
     if ax is None:
         ax = plt.gca()
+    else:
+        del kwargs['ax']
+
+    if len(args) == 0:
+        args = ('ok',)  # Black circles by default
+    kwargs.setdefault('markerfacecolor', 'white')
+    kwargs.setdefault('markersize', 8.0)
+    kwargs.setdefault('markeredgewidth', 1.5)
 
     # If no alpha specified, just draw the targets as markers in a single call.
     # This is typical in non-parametric plots.
@@ -243,6 +253,50 @@ def plot_targets(x_targets, *args, **kwargs):
     for i, xi in enumerate(x_targets):
         alpha_i = alpha + (1-alpha)*(i/(len(x_targets)-1) if len(x_targets) > 1 else 1)
         kwargs['color'] = color * alpha_i + (1-alpha_i) * white 
-        ax.plot(as_numpy(x_targets[i,0]), as_numpy(x_targets[i,1]), *args, **kwargs)
+        ax.plot(as_numpy(xi[0]), as_numpy(xi[1]), *args, **kwargs)
 
 
+def plot_parametric_linprog(plp, u, color='k', linestyle=None, xylim=None, show_solutions=False, cxy=None):
+    """
+    Plots the constraints and c-vector of a parametric linear program over the specified values of parameter u.
+    Here plp should be an instance of ParametricLP and u should be a Nx1 tensor where there are N distinct values
+    at which the linear program for plp(u[i]) should be plotted.
+    In order to depict the feasible regions and c-vectors as overlapping, the early values in u will be plotted
+    with a lighter (semi-transparent) opacity whereas the final value will be ploted with the full color intensity.
+    As such, plotting is only implemented for 1-dimensional u, currently.
+    
+    if show_solutions is True, then each LP will also be solved and its solution x* will be plotted as a circle.
+    
+    Use cxy=(x_value, y_value) to specify where the c-vector should be drawn, for example to avoid
+    overlapping your feasible region.
+    """
+    assert u.dim() == 2, "Expected 2-dimensional u tensor"
+    assert len(u) > 0, "Expected non-empty u tensor"
+    if u.size(1) != 1:
+        raise NotImplementedError("Only plotting of 1-dimensional u vectors is currently implemented.")
+    
+    if cxy is None:
+        cxy = (0.1, 0.1)
+    
+    # Set up the plot
+    ax = plt.gca()
+    if xylim:
+        xlim, ylim = xylim
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+    ax.set_aspect('equal', 'box')
+    
+    # Plot each set of constraints
+    alpha_min = 0.1
+    for i, ui in enumerate(u):
+        # Alpha progresses from initial alpha to 1.0 as we go through the points
+        alpha_i = alpha_min + (1-alpha_min)*(i/(len(u)-1) if len(u) > 1 else 1)
+        
+        # Get the LP corresponding to u[i] and plot its feasible region.
+        c, A_ub, b_ub, _, _ = as_numpy(*plp(ui))
+        plot_linprog_hull(c, A_ub, b_ub, color=color, alpha=alpha_i, linestyle=linestyle, cxy=cxy)
+            
+    if show_solutions:
+        # For each u value, solve the LP to reasonably high precision and plot them as targets, even though they're solutions.
+        x = torch.cat([linprog(*plp(ui)).t() for ui in u])
+        plot_targets(x, 'o', ax=ax, color=color, alpha=alpha_min)
