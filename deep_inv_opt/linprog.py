@@ -200,7 +200,7 @@ def linprog_feasible(A_ub, b_ub, A_eq=None, b_eq=None,
 
     # If slack variable < 0 and the equality constraints are satisfied, then we can stop.
     def is_feasible(x, A_eq, b_eq):
-        return x[-1] < 0 and (A_eq is None or torch.allclose(A_eq @ x - b_eq, torch.zeros_like(x)))
+        return x[-1] < 0 and (A_eq is None or torch.allclose(A_eq @ x - b_eq, torch.zeros_like(b_eq), atol=1e-5))
 
     # Terminates _linprog_ip as soon as a feasible point is found
     def check_feasible(step, c, A_ub, b_ub, A_eq, b_eq, x, dx, t):
@@ -212,14 +212,7 @@ def linprog_feasible(A_ub, b_ub, A_eq=None, b_eq=None,
     n_eq, _ = A_eq.shape if A_eq is not None else (0, m)
     assert m == _, "expected same number of columns in A_ub and A_eq"
 
-    # Construct initial feasible point for the max-infeasibility LP
-    if A_eq is not None: 
-        x0 = torch.zeros((m, 1), dtype=torch.double)
-        s0 = b_ub
-    else:
-        x0 = torch.zeros((m, 1), dtype=torch.double)
-        s0 = torch.min(b_ub).view(-1, 1) * -1.5 + 1 # Equivalent to max(A_ub @ x0 - b_ub) when x0=0
-
+    # Construct x_init=(x0, s0) such that x_init is strictly feasible wrt inequalities of the max-infeasibility LP
     x0 = torch.zeros((m, 1), dtype=torch.double)
     s0 = torch.min(b_ub).view(-1, 1) * -1.5 + 1 # Equivalent to max(A_ub @ x0 - b_ub) when x0=0
     x_init = torch.cat((x0, s0), 0)
@@ -261,7 +254,7 @@ def linprog(c, A_ub, b_ub, A_eq=None, b_eq=None,
     # Sanity check that equality constraints are satisfied.
     # If the system is properly infeasible, it should have been caught by linprog_feasible raising an exception, so this is an internal check.
     if A_eq is not None:
-        assert torch.allclose(A_eq @ x - b_eq, torch.zeros_like(x)), "linprog failed to satisfy equality constraints, but also failed to detect infeasibility, so there's something wrong"
+        assert torch.allclose(A_eq @ x - b_eq, torch.zeros_like(b_eq), atol=1e-5), "linprog failed to satisfy equality constraints, but also failed to detect infeasibility, so there's something wrong"
 
     return x
 

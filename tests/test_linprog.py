@@ -57,6 +57,14 @@ class test_linprog(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             x = io.linprog_feasible(A_ub2, b_ub2, A_eq, b_eq)
 
+        # Check that a feasible point is detected under multiple EQUALITIES
+        A_ub3 = io.tensor([[-1.0, 0.0],   # x1 >= 0
+                           [ 0.0,-1.0]])  # x2 >= 0
+        b_ub3 = io.tensor([[0.0],
+                           [0.0]])
+        x = io.linprog_feasible(A_ub3, b_ub3, A_eq2, b_eq2)
+        self.assertVectorEqual(x, [5, 5])
+
 
     def test_linprog_feasible_unbounded(self):
 
