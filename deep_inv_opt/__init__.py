@@ -21,10 +21,3 @@ from .util import as_tensor
 from .util import as_numpy
 from .util import as_str
 from .util import build_tensor
-from .linprog_batch import linprog_feasible_batch
-from .linprog_batch import linprog_batch
-from .linprog_batch import custom_linprog_batch
-from .linprog_batch import inverse_parametric_linprog_batch
-from .linprog_batch import inverse_parametric_linprog_batch_step_printer
-
-

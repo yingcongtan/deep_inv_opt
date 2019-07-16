@@ -189,8 +189,7 @@ def inverse_parametric_linprog(u, x, f,
                 f.weights.data[:] = w0
                 print("Stopping early due to step_size < 1e-16.")
                 break
-        # if curr_loss <eps:
-        #     break
+
 
     # Report final state
     if callback:
