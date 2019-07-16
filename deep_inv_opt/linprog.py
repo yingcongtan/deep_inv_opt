@@ -121,7 +121,6 @@ def _linprog_ip(x, c, A_ub, b_ub, A_eq, b_eq,
         
         grad_f = grad_obj + grad_phi  # Gradient of f(x) = tc'x + phi(x)
         hess_f = hess_obj + hess_phi  # Hessian of f(x) = tc'x + phi(x)
-
         if A_eq is not None:
             # Newton WITH equality constraints            
             # M = [[ H  A' ],
@@ -135,7 +134,6 @@ def _linprog_ip(x, c, A_ub, b_ub, A_eq, b_eq,
             # where g is gradient of the entire objective f(x) = t*c'x + phi(x)
             # (10.19 in BV book)
             v = torch.cat((-grad_f, b_eq - A_eq @ x), 0)
-            
         else:
             # Newton WITHOUT equality constraints
             M = hess_f
@@ -143,7 +141,8 @@ def _linprog_ip(x, c, A_ub, b_ub, A_eq, b_eq,
         
         # Compute Newton step for infeasible points
         try:
-            dxw = torch.inverse(M) @ v      # Direction of Newton step with slack variables w
+            # dxw = torch.inverse(M) @ v      # Direction of Newton step with slack variables w
+            dxw = torch.solve(v,M).solution
         except RuntimeError as e:
             if any("Lapack Error" in arg for arg in e.args):
                 raise MatrixInverseError(*e.args)
@@ -182,6 +181,122 @@ def _linprog_ip(x, c, A_ub, b_ub, A_eq, b_eq,
 
     return x
 
+def _infeaStartNewton(x_init, c, A_ub, b_ub, A_eq, b_eq,
+                      max_steps, t0, eps, callback):
+
+    #     rewrite ineq constraints using log barrier function:
+    #     min   t_0* c'X - Sum log(b_ub - A_ub@X)
+    #     s.t.  A_eq@X == b_eq 
+
+    def _infeaStartNewton_line_search(  rN, rP, rD, 
+                                        x, xDual, dx, dxDual,
+                                        alpha=0.1, beta=0.3):
+        # Algorithm 10.2 from the BV book
+        # backtrack line search to ensure that newton's step imporves the primal/dual residuals
+        step_size = 1.0
+        while not (1-alpha*step_size)*rN(rP(x), rD(xDual)) >= rN(rP(x+step_size*dx), rD(xDual+step_size*dxDual)):
+            step_size = step_size*beta
+            if step_size == 0.0:
+                raise RuntimeError("line search encountered a step size of zero!")
+        # Additional line search added for our algorithm, to ensure inequality constratins are satisfied
+        while all(A_ub@(x+step_size*dx)<= b_ub) is not True:
+            step_size = step_size*beta
+            if step_size == 0.0:
+                raise RuntimeError("line search encountered a step size of zero!")
+        return step_size
+
+    def is_feasible(x):
+        return torch.allclose(x[-1], torch.zeros((1,1),dtype = torch.double), atol=1e-5)
+
+    """Returns a solution to the given LP using the interior point method."""
+
+    m = len(c)        # Number of variables
+    n_ub = len(A_ub)  # Number inequality constraints
+    n_eq = len(A_eq)     
+    t = t0
+    # Objective function of barrier method f(x) = t * c'x - \sum_i log(-ai'x +bi)
+    # Note that x inside the lambda does not refer to the _linprog_ip argument x already in scope,
+    # but the grad_f value is captured by reference from _linprog_ip and will be whatever the
+    # current value of grad_f is whenever it's invoked
+
+    # Functions for computing primal, dual residual
+    rP = lambda x: A_eq@x-b_eq
+    rD = lambda xDual: grad_f + A_eq.t()@xDual
+    rN = lambda rprimal, rdual: torch.norm(torch.cat((rprimal, rdual), 0))
+
+    # initialize dual var
+    xDual = torch.ones((n_eq,1), dtype = torch.double)
+    x = x_init
+
+    # Run Newton's Method loop
+    for step in range(1, max_steps+1):
+        # print("step", step)
+
+        # [H_f, A']  [dx]      =  [-g_f - A'xDual]
+        # [A  , 0 ]  [dxDual]  =  [ b-A@X]
+
+        # Newton step to next point on central path
+        d = 1 / (b_ub - A_ub @ x)
+        grad_phi = A_ub.t() @ d                # Gradient of barrier phi(x)
+        hess_phi = A_ub.t() @ ((d**2) * A_ub)  # Hessian of barrier phi(x)
+                                               # (Equiv to A.t() @ torch.diagflat(d**2) @ A)
+        grad_obj = t*c  # Gradient of t c'x
+        hess_obj = 0    # Hessian of t c'x
+
+        grad_f = grad_obj + grad_phi  # Gradient of f(x) = tc'x + phi(x)
+        hess_f = hess_obj + hess_phi  # Hessian of f(x) = tc'x + phi(x)
+
+        # Newton WITH equality constraints            
+        # M = [[ H  A' ],
+        #      [ A  0  ]]
+        # where H is Hessian of the entire objective f(x) = t*c'x + phi(x)
+        # (10.19 in BV book)
+        M = torch.cat((torch.cat((hess_f, A_eq.t()), 1),
+                       torch.cat((A_eq, torch.zeros(n_eq, n_eq, dtype=A_eq.dtype)), 1)), 0)
+        # v =  [[-g - A'xDual] 
+        #       [ b - Ax ]],
+        # where g is gradient of the entire objective f(x) = t*c'x + phi(x)
+        # (10.19 in BV book)
+        v = torch.cat((- grad_f - A_eq.t()@xDual, b_eq - A_eq @ x), 0)
+
+
+        # Compute Newton step for infeasible points
+        try:
+            # dxw = torch.inverse(M) @ v      # Direction of Newton step with slack variables w
+            dxw = torch.solve(v,M).solution
+        except RuntimeError as e:
+            if any("Lapack Error" in arg for arg in e.args):
+                raise MatrixInverseError(*e.args)
+            raise
+        dx = dxw[:m]                    # gradient of primal variables
+        dxDual = dxw[m:]            # gradient of dual variables
+
+
+        step_size = _infeaStartNewton_line_search(rN, rP, rD, 
+                                                  x, xDual, dx, dxDual)
+        x = x + step_size*dx
+        xDual = xDual + step_size*dxDual
+
+        if max(abs(x)>1e30):
+            raise UnboundedConstraintsError
+
+
+        # Stop when finding a feasible solution
+        # the objective is to find a strictl feasible solution
+        # we terminate immediately after proving feasbility
+        # Thus, no need to update t = t*mu as normal IPM
+        if is_feasible(x) == True:
+            break
+
+        # if rN(rP(x), rD(xDual))<= eps:
+        #     break
+        step += 1
+
+    #report final state
+    if callback:
+        callback(None, c, A_ub, b_ub, A_eq, b_eq, x, None, t)
+    
+    return x
 
 # Allows linprog_feasible to raise an error that specifically
 # identifies that an infeasible instance was detected and that no feasible
@@ -191,68 +306,116 @@ class InfeasibleConstraintsError(RuntimeError):
 class UnboundedConstraintsError(RuntimeError):
     pass
 
-def linprog_feasible(A_ub, b_ub, A_eq=None, b_eq=None,
-                     max_steps=100, t0=1.0, mu=2.0, eps=0.001,
-                     callback=None):  # TODO increase t0 once line search implemented
+def linprog_feasible(c, A_ub, b_ub, A_eq=None, b_eq=None, 
+                     max_steps=100,t0=1.0, mu=2.0, eps=0.001,
+                     callback=None):
+
     """Returns a strictly feasible point for the given LP."""
     assert max_steps >= 1
     assert (A_eq is None) == (b_eq is None)
 
     # If slack variable < 0 and the equality constraints are satisfied, then we can stop.
-    def is_feasible(x, A_eq, b_eq):
-        return x[-1] < 0 and (A_eq is None or torch.allclose(A_eq @ x - b_eq, torch.zeros_like(b_eq), atol=1e-5))
+    def is_feasible(x, A_ub, b_ub, A_eq, b_eq):
+        return all([all(A_ub@x <=b_ub),  # ineuqality constraint feasibility
+                    (A_eq is None or torch.allclose(A_eq @ x - b_eq, torch.zeros_like(b_eq), atol=1e-5) )])  # ineuqality constraint feasibility
 
     # Terminates _linprog_ip as soon as a feasible point is found
     def check_feasible(step, c, A_ub, b_ub, A_eq, b_eq, x, dx, t):
         if callback is not None:
             callback(step, c, A_ub, b_ub, A_eq, b_eq, x, dx, t)  # Forward args to user callback if applicable
-        return is_feasible(x, A_eq, b_eq)
+        return is_feasible(x, A_ub, b_ub, A_eq, b_eq)
 
     n_ub, m = A_ub.shape
-    n_eq, _ = A_eq.shape if A_eq is not None else (0, m)
-    assert m == _, "expected same number of columns in A_ub and A_eq"
 
-    # Construct x_init=(x0, s0) such that x_init is strictly feasible wrt inequalities of the max-infeasibility LP
-    x0 = torch.zeros((m, 1), dtype=torch.double)
-    s0 = torch.min(b_ub).view(-1, 1) * -1.5 + 1 # Equivalent to max(A_ub @ x0 - b_ub) when x0=0
-    x_init = torch.cat((x0, s0), 0)
+    if A_eq is not None:
+        #     min   0
+        #     s.t.  A_ub@X <= b_ub
+        #           A_eq@X == b_eq 
+            
+        #     equivalently:
+        #     min   0
+        #     s.t.  A_ub@X -s <= b_ub 
+        #           A_eq@X    == b_eq
+        #                   s == 0
+            
+        #     update:
+        #             c = [[0]
+        #                  [1]]
+        #             x = [[X]
+        #                  [S]]
+        #             A_ub = [A_ub,  -1]
+        #             A_eq = [[A_ub, 0]   # A_eq@X == b_eq
+        #                     [ 0,   1]]  # s=0
+        #             b_eq = [0]          # s=0
+                       
+        n_eq, _ = A_eq.shape 
+        assert m == _, "expected same number of columns in A_ub and A_eq"
 
-    # Construct the max-infeasibility LP
-    c = torch.cat((torch.zeros((m, 1), dtype=torch.double),
-                   torch.ones((1, 1), dtype=torch.double)), 0)
-    A_ub = torch.cat((A_ub, -torch.ones((n_ub, 1), dtype=torch.double)), 1)
-    A_eq = torch.cat((A_eq, torch.zeros((n_eq, 1), dtype=torch.double)), 1) if A_eq is not None else None
+        # Construct x_init=(x0, s0) such that x_init is strictly feasible wrt inequalities of the max-infeasibility LP
+        x0 = torch.zeros((m, 1), dtype=torch.double)
+        s0 = torch.min(b_ub).view(-1, 1) * -1 + 1 # Equivalent to max(A_ub @ x0 - b_ub) when x0=0
+        x_init = torch.cat((x0, s0), 0)
 
-    # Hack to prevent infeasibility problem instance from being unbounded (nonsingular Hessian)
-    s_lower_bound = 10.0*(1.0 + torch.max(torch.abs(A_ub.detach()))).view(1, 1)   # Make lower bound dependent on scale of constraint coefficients
-    A_ub = torch.cat((A_ub, -c.t()), 0)
-    b_ub = torch.cat((b_ub, s_lower_bound), 0)
+        # Construct the max-infeasibility LP
+        c = torch.cat ( (c, torch.zeros((1,1), dtype=torch.double) ), 0)
+        # c = torch.cat((torch.zeros((m,1), dtype=torch.double), torch.zeros((1,1), dtype=torch.double)),0)
+        A_ub = torch.cat((A_ub, -torch.ones((n_ub, 1), dtype=torch.double)), 1)
+        A_eq = torch.cat((A_eq, torch.zeros((n_eq, 1), dtype=torch.double)), 1) 
+        A_eq = torch.cat((A_eq, torch.cat((torch.zeros((1,m),dtype=torch.double),
+                                           torch.ones((1,1),dtype=torch.double) ),1)  
+                        ),0)
+        b_eq = torch.cat((b_eq, torch.zeros((1,1), dtype=torch.double)),0)
+        
+        x_center = _infeaStartNewton(x_init, c, A_ub, b_ub, A_eq, b_eq, 
+                                t0=t0, max_steps=max_steps, eps=eps, 
+                                callback=check_feasible)
+    else:
+        n_eq, _ = A_eq.shape if A_eq is not None else (0, m)
+        assert m == _, "expected same number of columns in A_ub and A_eq"
 
-    # Solve the max-infeasible LP with interior point
-    x_center = _linprog_ip(x_init, c, A_ub, b_ub, A_eq, b_eq,
-                           max_steps=max_steps, t0=t0, mu=mu, eps=eps,
-                           callback=check_feasible)
+        # Construct x_init=(x0, s0) such that x_init is strictly feasible wrt inequalities of the max-infeasibility LP
+        x0 = torch.zeros((m, 1), dtype=torch.double)
+        s0 = torch.min(b_ub).view(-1, 1) * -1.5 + 1 # Equivalent to max(A_ub @ x0 - b_ub) when x0=0
+        x_init = torch.cat((x0, s0), 0)
 
+        # Construct the max-infeasibility LP
+        c = torch.cat((torch.zeros((m, 1), dtype=torch.double),
+                    torch.ones((1, 1), dtype=torch.double)), 0)
+        A_ub = torch.cat((A_ub, -torch.ones((n_ub, 1), dtype=torch.double)), 1)
+        A_eq = torch.cat((A_eq, torch.zeros((n_eq, 1), dtype=torch.double)), 1) if A_eq is not None else None
+
+        # Hack to prevent infeasibility problem instance from being unbounded (nonsingular Hessian)
+        s_lower_bound = 10.0*(1.0 + torch.max(torch.abs(A_ub.detach()))).view(1, 1)   # Make lower bound dependent on scale of constraint coefficients
+        A_ub = torch.cat((A_ub, -c.t()), 0)
+        b_ub = torch.cat((b_ub, s_lower_bound), 0)
+
+        # Solve the max-infeasible LP with interior point
+        x_center = _linprog_ip(x_init, c, A_ub, b_ub, A_eq, b_eq,
+                            max_steps=max_steps, t0=t0, mu=mu, eps=eps,
+                            callback=check_feasible)
+
+    # print("x_center", x_center)
     # Check strict feasibility
-    if not is_feasible(x_center, A_eq, b_eq):
+    if not is_feasible(x_center, A_ub, b_ub, A_eq, b_eq):
         raise InfeasibleConstraintsError("Constraints were not strictly feasible, or strictly feasible point not found in allotted steps.")
 
     # Return strictly feasible point for original LP
     return x_center[:-1]
-
 
 def linprog(c, A_ub, b_ub, A_eq=None, b_eq=None,
             max_steps=100, t0=1.0, mu=2.0, eps=1e-5,
             callback=None):
     """Returns a solution to the given LP using the interior point method."""    
 
-    x = linprog_feasible(A_ub, b_ub, A_eq, b_eq)  # A_eq, b_eq deliberately omitted, since subsequent _linprog_ip is infeasible start Newton
-    x = _linprog_ip(x, c, A_ub, b_ub, A_eq, b_eq,
+    x_init = linprog_feasible(c, A_ub, b_ub, A_eq, b_eq, 
+                    max_steps=max_steps, t0=t0, mu=mu, eps=eps,)  # A_eq, b_eq deliberately omitted, since subsequent _linprog_ip is infeasible start Newton
+
+    x = _linprog_ip(x_init, c, A_ub, b_ub, A_eq, b_eq,
                     max_steps=max_steps, t0=t0, mu=mu, eps=eps,
                     callback=callback)
 
     # Sanity check that equality constraints are satisfied.
-    # If the system is properly infeasible, it should have been caught by linprog_feasible raising an exception, so this is an internal check.
+    # If the system is properly infeasible, it should have been caught by _infeaStartNewton raising an exception, so this is an internal check.
     if A_eq is not None:
         assert torch.allclose(A_eq @ x - b_eq, torch.zeros_like(b_eq), atol=1e-5), "linprog failed to satisfy equality constraints, but also failed to detect infeasibility, so there's something wrong"
 
